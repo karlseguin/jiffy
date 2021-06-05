@@ -65,6 +65,8 @@ static char* shifts[NUM_SHIFTS] = {
     "\x0f\n              "
 };
 
+static inline int enc_char(Encoder* e, char c);
+static inline int enc_long(Encoder* e, ErlNifSInt64 val);
 
 Encoder*
 enc_new(ErlNifEnv* env)
@@ -391,6 +393,17 @@ enc_object_key(ErlNifEnv *env, Encoder* e, ERL_NIF_TERM val)
 {
     if(enif_is_atom(env, val)) {
         return enc_atom(e, val);
+    }
+
+    ErlNifSInt64 lval;
+    if(enif_get_int64(env, val, &lval)) {
+        int res = enc_char(e, '"');
+        if (!res) return res;
+
+        res = enc_long(e, lval);
+        if (!res) return res;
+
+        return enc_char(e, '"');
     }
 
     return enc_string(e, val);
@@ -885,7 +898,7 @@ encode_iter(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
                 ret = enc_obj_error(e, "invalid_object_member_arity", item);
                 goto done;
             }
-            if(!enc_object_key(env, e, tuple[0])) {
+           if(!enc_object_key(env, e, tuple[0])) {
                 ret = enc_obj_error(e, "invalid_object_member_key", tuple[0]);
                 goto done;
             }
