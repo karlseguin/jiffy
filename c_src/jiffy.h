@@ -44,6 +44,15 @@ typedef struct {
     ERL_NIF_TERM    atom_escape_forward_slashes;
     ERL_NIF_TERM    atom_dedupe_keys;
     ERL_NIF_TERM    atom_copy_strings;
+    ERL_NIF_TERM    atom_elixir_struct;
+    ERL_NIF_TERM    atom_elixir_datetime_year;
+    ERL_NIF_TERM    atom_elixir_datetime_month;
+    ERL_NIF_TERM    atom_elixir_datetime_day;
+    ERL_NIF_TERM    atom_elixir_datetime_hour;
+    ERL_NIF_TERM    atom_elixir_datetime_minute;
+    ERL_NIF_TERM    atom_elixir_datetime_second;
+    ERL_NIF_TERM    atom_elixir_datetime_microsecond;
+
 
     ERL_NIF_TERM    ref_object;
     ERL_NIF_TERM    ref_array;

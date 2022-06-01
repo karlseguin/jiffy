@@ -30,6 +30,20 @@ to_bin(N) when is_integer(N) ->
     list_to_binary(integer_to_list(N)).
 
 
+elixir_structs_test_() ->
+    Obj = #{id => 1, '__struct__' => 'An.Elixit.Struct', name => <<"Leto">>},
+    Enc = enc(Obj),
+    ?_assertEqual(<<"{\"name\":\"Leto\",\"id\":1}">>, Enc).
+
+elixir_datetime_test_() ->
+    Obj = #{d => #{'__struct__' => 'Elixir.DateTime', year => 2022, month => 5, day => 8, hour => 2, minute => 6, second => 1, microsecond => {123456, 6}}},
+    Enc = enc(Obj),
+    ?_assertEqual(<<"{\"d\":\"2022-05-08T02:06:01.123Z\"}">>, Enc).
+
+elixir_datetime_error_test_() ->
+    Obj = #{d => #{'__struct__' => 'Elixir.DateTime'}},
+    ?_assertError(invalid_datetime, jiffy:encode(Obj)).
+
 gen(ok, {J, E}) ->
     gen(ok, {J, E, J});
 gen(ok, {J1, E, J2}) ->

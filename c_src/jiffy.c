@@ -35,6 +35,14 @@ load(ErlNifEnv* env, void** priv, ERL_NIF_TERM info)
     st->atom_escape_forward_slashes = make_atom(env, "escape_forward_slashes");
     st->atom_dedupe_keys = make_atom(env, "dedupe_keys");
     st->atom_copy_strings = make_atom(env, "copy_strings");
+    st->atom_elixir_struct = make_atom(env, "__struct__");
+    st->atom_elixir_datetime_year = make_atom(env, "year");
+    st->atom_elixir_datetime_month = make_atom(env, "month");
+    st->atom_elixir_datetime_day = make_atom(env, "day");
+    st->atom_elixir_datetime_hour = make_atom(env, "hour");
+    st->atom_elixir_datetime_minute = make_atom(env, "minute");
+    st->atom_elixir_datetime_second = make_atom(env, "second");
+    st->atom_elixir_datetime_microsecond = make_atom(env, "microsecond");
 
     // Markers used in encoding
     st->ref_object = make_atom(env, "$object_ref$");

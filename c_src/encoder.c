@@ -610,7 +610,63 @@ enc_comma(Encoder* e)
 
 #if MAP_TYPE_PRESENT
 int
-enc_map_to_ejson(ErlNifEnv* env, ERL_NIF_TERM map, ERL_NIF_TERM* out)
+enc_elixir_datetime(ErlNifEnv* env, Encoder* e, ERL_NIF_TERM map) {
+    if(!enc_ensure(e, 26)) {
+        return 0;
+    }
+
+    int year;
+    int month;
+    int day;
+    int hour;
+    int minute;
+    int second;
+
+    // for microseconds
+    int arity;
+    long microsecond;
+    const ERL_NIF_TERM* tuple;
+
+    // extract each value (year, day, ... into here)
+    ERL_NIF_TERM val;
+
+    char date[27]; // +1 for null terminator
+    jiffy_st* atoms = e->atoms;
+
+    if (!enif_get_map_value(env, map, atoms->atom_elixir_datetime_year, &val) || !enif_get_int(env, val, &year)) {
+        return 0;
+    }
+    if (!enif_get_map_value(env, map, atoms->atom_elixir_datetime_month, &val) || !enif_get_int(env, val, &month)) {
+        return 0;
+    }
+    if (!enif_get_map_value(env, map, atoms->atom_elixir_datetime_day, &val) || !enif_get_int(env, val, &day)) {
+        return 0;
+    }
+    if (!enif_get_map_value(env, map, atoms->atom_elixir_datetime_hour, &val) || !enif_get_int(env, val, &hour)) {
+        return 0;
+    }
+    if (!enif_get_map_value(env, map, atoms->atom_elixir_datetime_minute, &val) || !enif_get_int(env, val, &minute)) {
+        return 0;
+    }
+    if (!enif_get_map_value(env, map, atoms->atom_elixir_datetime_second, &val) || !enif_get_int(env, val, &second)) {
+        return 0;
+    }
+
+    if (!enif_get_map_value(env, map, atoms->atom_elixir_datetime_microsecond, &val) || !enif_get_tuple(env, val, &arity, &tuple) || arity != 2 || !enif_get_int64(env, tuple[0], &microsecond)) {
+        return 0;
+    }
+
+    sprintf(date, "\"%d-%02d-%02dT%02d:%02d:%02d.%03ldZ\"", year, month, day, hour, minute, second, (microsecond/1000));
+
+    memcpy(&(e->p[e->i]), date, 26);
+    e->i += 26;
+    e->count++;
+
+    return 1;
+}
+
+int
+enc_map_to_ejson(ErlNifEnv* env, char* scrap, ERL_NIF_TERM map, ERL_NIF_TERM* out)
 {
     ErlNifMapIterator iter;
     size_t size;
@@ -640,6 +696,11 @@ enc_map_to_ejson(ErlNifEnv* env, ERL_NIF_TERM map, ERL_NIF_TERM* out)
             enif_map_iterator_destroy(env, &iter);
             return 0;
         }
+
+        if (enif_is_atom(env, key)
+            && enif_get_atom(env, key, scrap, 11, ERL_NIF_LATIN1)
+            && strcmp("__struct__", scrap) == 0) { continue; }
+
         tuple = enif_make_tuple2(env, key, val);
         list = enif_make_list_cell(env, tuple, list);
     } while(enif_map_iterator_next(env, &iter));
@@ -722,6 +783,8 @@ encode_iter(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
     double dval;
 
     void* res;
+
+    unsigned char scrap[255];
 
     size_t start;
     size_t bytes_processed = 0;
@@ -912,11 +975,20 @@ encode_iter(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
             termstack_push(&stack, tuple[1]);
 #if MAP_TYPE_PRESENT
         } else if(enif_is_map(env, curr)) {
-            if(!enc_map_to_ejson(env, curr, &curr)) {
+
+            if (enif_get_map_value(env, curr, e->atoms->atom_elixir_struct, &item) && enif_get_atom(env, item, (char*)scrap, 250, ERL_NIF_LATIN1)) {
+                if (strcmp("Elixir.DateTime", (char*)scrap) == 0) {
+                    if (!enc_elixir_datetime(env, e, curr)) {
+                        ret = enc_error(e, "invalid_datetime");
+                        goto done;
+                    }
+                    continue;
+                }
+            }
+            if (!enc_map_to_ejson(env, (char*)scrap, curr, &curr)) {
                 ret = enc_error(e, "internal_error");
                 goto done;
             }
-
             termstack_push(&stack, curr);
 #endif
         } else if(enif_is_list(env, curr)) {
