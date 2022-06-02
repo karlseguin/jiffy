@@ -3,7 +3,7 @@ Fork
 The changes made in this fork are:
 
 1. The `:__struct__` key and value from Elixir structures are not encoded
-2. Elixir's DateTime is encoded as an RFC3339 string. The DateTime must be in UTC
+2. Elixir's DateTime is encoded as an RFC3339 string. The DateTime is assumed to be in UTC
 3. [PR150](https://github.com/davisp/jiffy/pull/150) merged to allow maps with integerst to be encoded
 
 Jiffy - JSON NIFs for Erlang
