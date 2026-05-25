@@ -11,7 +11,57 @@
 latin1_atom_test_() ->
     Key = list_to_atom([228]), %% `ä`
     Expected = <<"{\"", 195, 164, "\":\"bar\"}">>,
-    ?_assertEqual(Expected, jiffy:encode({[{Key, <<"bar">>}]})).
+    ?_assertEqual(Expected, enc({[{Key, <<"bar">>}]})).
+
+% These are slightly sneaky and contain a NUL
+latin1_nul_atom_test_() ->
+    Bad = binary_to_atom(<<0, 1, 255, 255, 255, 255>>, latin1),
+    [
+        ?_assertEqual(<<"\"\\u0000\\u0001ÿÿÿÿ\""/utf8>>, enc(Bad)),
+        ?_assertEqual(<<"\"\\u0000\\u0001\\u00FF\\u00FF\\u00FF\\u00FF\"">>,
+                      enc(Bad, [uescape]))
+    ].
+
+% From issue https://github.com/davisp/jiffy/issues/231
+% ERL_NIF_UTF8 was added in NIF 2.17 (OTP 26) though
+-if(?OTP_RELEASE >= 26).
+utf8_atom_test_() ->
+    % 2-byte UTF8
+    Satas = binary_to_atom(<<"ŝatas"/utf8>>, utf8),
+    % 3-byte UTF8 (Google translated this as "Hello")
+    Hello = binary_to_atom(<<"你好"/utf8>>, utf8),
+    % 4-byte UTF8 (Rocket)
+    Rocket = binary_to_atom(<<"🚀"/utf8>>, utf8),
+    [
+        ?_assertEqual(<<"\"", "ŝatas"/utf8, "\"">>, enc(Satas)),
+        ?_assertEqual(<<"\"", "你好"/utf8, "\"">>, enc(Hello)),
+        ?_assertEqual(<<"\"", "🚀"/utf8, "\"">>, enc(Rocket)),
+        ?_assertEqual(<<"\"\\u015Datas\"">>, enc(Satas, [uescape])),
+        ?_assertEqual(<<"\"\\u4F60\\u597D\"">>, enc(Hello, [uescape])),
+        ?_assertEqual(<<"\"\\uD83D\\uDE80\"">>,  enc(Rocket, [uescape])),
+        ?_assertEqual(<<"{\"", "ŝatas"/utf8, "\":\"v\"}">>, enc(#{Satas => <<"v">>})),
+        ?_assertEqual(atom_to_binary(Satas, utf8), dec(enc(Satas))),
+        ?_assertEqual(atom_to_binary(Hello, utf8), dec(enc(Hello))),
+        ?_assertEqual(atom_to_binary(Rocket, utf8), dec(enc(Rocket)))
+    ].
+-else.
+utf8_atom_test_() ->
+    % ERL_NIF_UTF8 isn't available so these atoms can't be extracted.
+    Satas = binary_to_atom(<<"ŝatas"/utf8>>, utf8),
+    Hello = binary_to_atom(<<"你好"/utf8>>, utf8),
+    Rocket = binary_to_atom(<<"🚀"/utf8>>, utf8),
+    [
+        ?_assertError({invalid_string, _}, enc(Satas)),
+        ?_assertError({invalid_string, _}, enc(Hello)),
+        ?_assertError({invalid_string, _}, enc(Rocket))
+    ].
+-endif.
+
+atom_key_test_() ->
+    [
+        ?_assertEqual(<<"{\"foo\":1}">>, enc({[{foo, 1}]})),
+        ?_assertEqual(<<"{\"bar\":2}">>, enc({[{bar, 2}]}))
+    ].
 
 
 string_success_test_() ->
@@ -130,7 +180,23 @@ cases(error) ->
         <<"\"\\uD834foo\\uDD1E\"">>,
         <<"\"\\u", 200, 200, 200, 200, "\"">>,
         % CouchDB-345
-        <<34,78,69,73,77,69,78,32,70,216,82,82,32,70,65,69,78,33,34>>
+        <<34,78,69,73,77,69,78,32,70,216,82,82,32,70,65,69,78,33,34>>,
+        % Lone high surrogate followed by non-backslash
+        <<"\"\\uD834a\"">>,
+        % Lone high surrogate followed by backslash but not 'u'
+        <<"\"\\uD834\\n\"">>,
+        % Lone high surrogate followed by \u but not a valid low surrogate
+        <<"\"\\uD834\\u0041\"">>,
+        % Truncated \uXX (not enough hex digits)
+        <<"\"\\u00\"">>,
+        % Invalid hex digit in \u escape
+        <<"\"\\uZZZZ\"">>,
+        % Same story as \uD834\n but with more trailers to pass the length
+        % guard and reach the '\u' check for the low surrogate. We're down in
+        % the weeds, as it were.
+        <<"\"\\uD834\\nabcdef\"">>,
+        % \uD834\u<bad hex> low surrogate hex error
+        <<"\"\\uD834\\uZZZZ\"">>
     ];
 
 cases(utf8) ->
@@ -189,5 +255,18 @@ cases(bad_utf8_key) ->
 
 cases(escaped_slashes) ->
     [
-        {<<"\"\\/\"">>, <<"/">>}
+        {<<"\"\\/\"">>, <<"/">>},
+        {<<"\"foo\\/bar\\/baz\"">>, <<"foo/bar/baz">>}
+    ].
+
+
+atom_escaped_slashes_test_() ->
+    [
+        ?_assertEqual(<<"\"a\\/b\"">>,
+            enc('a/b', [escape_forward_slashes])),
+        ?_assertEqual(<<"\"a/b\"">>, enc('a/b')),
+        ?_assertEqual(<<"{\"a\\/b\":1}">>,
+            enc({[{'a/b', 1}]}, [escape_forward_slashes])),
+        ?_assertEqual(<<"\"foo\\/bar\\/baz\\/potato\"">>,
+            enc('foo/bar/baz/potato', [escape_forward_slashes]))
     ].

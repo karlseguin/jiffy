@@ -1,7 +1,19 @@
 // This file is part of Jiffy released under the MIT license.
 // See the LICENSE file for more information.
+//
+// Note: we're doing a "unity build" pattern here: all sources are compiled as
+// a single translation unit so the compiler can optimize across file
+// boundaries without lto
 
-#include "jiffy.h"
+// Pull in ffc.h implementation once for the whole unity build.
+#define FFC_IMPL
+#include "ffc.h"
+
+#include "decoder.c"
+#include "encoder.c"
+#include "objects.c"
+#include "util.c"
+#include "ryu/d2s.c"
 
 static int
 load(ErlNifEnv* env, void** priv, ERL_NIF_TERM info)
@@ -17,13 +29,11 @@ load(ErlNifEnv* env, void** priv, ERL_NIF_TERM info)
     st->atom_true = make_atom(env, "true");
     st->atom_false = make_atom(env, "false");
     st->atom_bignum = make_atom(env, "bignum");
-    st->atom_bignum_e = make_atom(env, "bignum_e");
     st->atom_bigdbl = make_atom(env, "bigdbl");
     st->atom_partial = make_atom(env, "partial");
     st->atom_uescape = make_atom(env, "uescape");
     st->atom_pretty = make_atom(env, "pretty");
     st->atom_force_utf8 = make_atom(env, "force_utf8");
-    st->atom_iter = make_atom(env, "iter");
     st->atom_bytes_per_iter = make_atom(env, "bytes_per_iter");
     st->atom_bytes_per_red = make_atom(env, "bytes_per_red");
     st->atom_return_maps = make_atom(env, "return_maps");
@@ -72,12 +82,6 @@ load(ErlNifEnv* env, void** priv, ERL_NIF_TERM info)
 }
 
 static int
-reload(ErlNifEnv* env, void** priv, ERL_NIF_TERM info)
-{
-    return 0;
-}
-
-static int
 upgrade(ErlNifEnv* env, void** priv, void** old_priv, ERL_NIF_TERM info)
 {
     return load(env, priv, info);
@@ -90,12 +94,12 @@ unload(ErlNifEnv* env, void* priv)
     return;
 }
 
+// {name, arity, fptr, dirty_flag}
+// dirty flag: 0 (default) | ERL_NIF_DIRTY_JOB_{IO|CPU}_BOUND
 static ErlNifFunc funcs[] =
 {
-    {"nif_decode_init", 2, decode_init},
-    {"nif_decode_iter", 5, decode_iter},
-    {"nif_encode_init", 2, encode_init},
-    {"nif_encode_iter", 3, encode_iter}
+    {"nif_decode_init", 2, decode_init, 0},
+    {"nif_encode_init", 2, encode_init, 0}
 };
 
-ERL_NIF_INIT(jiffy, funcs, &load, &reload, &upgrade, &unload);
+ERL_NIF_INIT(jiffy, funcs, &load, NULL, &upgrade, &unload);

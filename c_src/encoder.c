@@ -2,15 +2,18 @@
 // See the LICENSE file for more information.
 
 #include <assert.h>
-#include <stdio.h>
 #include <string.h>
 
 #include "jiffy.h"
-#include "termstack.h"
+#include "jiffy_simd.h"
+#include "jiffy_utf8.h"
+#include "ryu/ryu.h"
 
 #define BIN_INC_SIZE 2048
 
 #define MIN(X, Y) ((X) < (Y) ? (X) : (Y))
+
+#define SMALL_TERMSTACK_SIZE 16
 
 #define MAYBE_PRETTY(e)             \
 do {                                \
@@ -20,10 +23,13 @@ do {                                \
     }                               \
 } while(0)
 
-#if WINDOWS || WIN32
-#define inline __inline
-#define snprintf  _snprintf
-#endif
+typedef struct {
+    ERL_NIF_TERM* elements;
+    size_t size;
+    size_t top;
+
+    ERL_NIF_TERM __default_elements[SMALL_TERMSTACK_SIZE];
+} TermStack;
 
 typedef struct {
     ErlNifEnv*      env;
@@ -65,10 +71,92 @@ static char* shifts[NUM_SHIFTS] = {
     "\x0f\n              "
 };
 
-static inline int enc_char(Encoder* e, char c);
-static inline int enc_long(Encoder* e, ErlNifSInt64 val);
 
-Encoder*
+static inline ERL_NIF_TERM
+termstack_save(ErlNifEnv* env, TermStack* stack)
+{
+    return enif_make_tuple_from_array(env, stack->elements, stack->top);
+}
+
+static inline int
+termstack_restore(ErlNifEnv* env, ERL_NIF_TERM from, TermStack* stack)
+{
+    const ERL_NIF_TERM* elements;
+    int arity;
+
+    if(enif_get_tuple(env, from, &arity, &elements)) {
+        assert(arity > 0 && "Erlang bug: enif_get_tuple returned a negative arity");
+
+        stack->top = arity;
+
+        if(arity <= SMALL_TERMSTACK_SIZE) {
+            stack->elements = &stack->__default_elements[0];
+            stack->size = SMALL_TERMSTACK_SIZE;
+        } else {
+            size_t size = SMALL_TERMSTACK_SIZE;
+            while(size < stack->top) {
+                size *= 2;
+            }
+            stack->size = size;
+            stack->elements = enif_alloc(size * sizeof(ERL_NIF_TERM));
+
+            if(!stack->elements) {
+                return 0;
+            }
+        }
+
+        memcpy(stack->elements, elements, arity * sizeof(ERL_NIF_TERM));
+        return 1;
+    }
+
+    return 0;
+}
+
+static inline void
+termstack_destroy(TermStack* stack)
+{
+    if(stack->elements != &stack->__default_elements[0]) {
+        enif_free(stack->elements);
+    }
+}
+
+static inline void
+termstack_push(TermStack* stack, ERL_NIF_TERM term)
+{
+
+    if(stack->top == stack->size) {
+        size_t new_size = stack->size * 2;
+        size_t num_bytes = new_size * sizeof(ERL_NIF_TERM);
+
+        if (stack->elements == &stack->__default_elements[0]) {
+            ERL_NIF_TERM* elems = enif_alloc(num_bytes);
+            memcpy(elems, stack->elements, SMALL_TERMSTACK_SIZE * sizeof(ERL_NIF_TERM));
+            stack->elements = elems;
+        } else {
+            stack->elements = enif_realloc(stack->elements, num_bytes);
+        }
+
+        stack->size = new_size;
+    }
+
+    assert(stack->top < stack->size);
+    stack->elements[stack->top++] = term;
+}
+
+static inline ERL_NIF_TERM
+termstack_pop(TermStack* stack)
+{
+    assert(stack->top > 0 && stack->top <= stack->size);
+    return stack->elements[--stack->top];
+}
+
+static inline int
+termstack_is_empty(TermStack* stack)
+{
+    return stack->top == 0;
+}
+
+static Encoder*
 enc_new(ErlNifEnv* env)
 {
     jiffy_st* st = (jiffy_st*) enif_priv_data(env);
@@ -101,7 +189,7 @@ enc_new(ErlNifEnv* env)
     return e;
 }
 
-int
+static int
 enc_init(Encoder* e, ErlNifEnv* env)
 {
     e->env = env;
@@ -118,20 +206,34 @@ enc_destroy(ErlNifEnv* env, void* obj)
     }
 }
 
-ERL_NIF_TERM
+static ERL_NIF_TERM
+make_error(jiffy_st* st, ErlNifEnv* env, const char* error)
+{
+    return enif_make_tuple2(env, st->atom_error, make_atom(env, error));
+}
+
+static ERL_NIF_TERM
 enc_error(Encoder* e, const char* msg)
 {
     //assert(0 && msg);
     return make_error(e->atoms, e->env, msg);
 }
 
-ERL_NIF_TERM
+static ERL_NIF_TERM
+make_obj_error(jiffy_st* st, ErlNifEnv* env,
+        const char* error, ERL_NIF_TERM obj)
+{
+    ERL_NIF_TERM reason = enif_make_tuple2(env, make_atom(env, error), obj);
+    return enif_make_tuple2(env, st->atom_error, reason);
+}
+
+static ERL_NIF_TERM
 enc_obj_error(Encoder* e, const char* msg, ERL_NIF_TERM obj)
 {
     return make_obj_error(e->atoms, e->env, msg, obj);
 }
 
-int
+static int
 enc_flush(Encoder* e)
 {
     ERL_NIF_TERM bin;
@@ -160,12 +262,12 @@ enc_ensure(Encoder* e, size_t req)
 {
     size_t new_size = BIN_INC_SIZE;
 
-    if(e->have_buffer) {
-        if(req < (e->buffer.size - e->i)) {
+    if(JIFFY_LIKELY(e->have_buffer)) {
+        if(JIFFY_LIKELY(req < (e->buffer.size - e->i))) {
             return 1;
         }
 
-        if(!enc_flush(e)) {
+        if(JIFFY_UNLIKELY(!enc_flush(e))) {
             return 0;
         }
 
@@ -244,9 +346,10 @@ enc_special_character(Encoder* e, int val) {
             e->p[e->i++] = 't';
             return 1;
         case '/':
-            if(e->escape_forward_slashes) {
-                e->p[e->i++] = '\\';
+            if(!e->escape_forward_slashes) {
+                return 0;
             }
+            e->p[e->i++] = '\\';
             e->p[e->i++] = '/';
             return 1;
         default:
@@ -259,49 +362,108 @@ enc_special_character(Encoder* e, int val) {
     }
 }
 
-static int
-enc_atom(Encoder* e, ERL_NIF_TERM val)
+// ERL_NIF_UTF8 was added in NIF 2.17 (OTP 26). We detect it to know
+// if we can pass it to enif_get_atom()
+#if ERL_NIF_MAJOR_VERSION > 2 \
+        || (ERL_NIF_MAJOR_VERSION == 2 && ERL_NIF_MINOR_VERSION >= 17)
+#define JIFFY_ENIF_HAS_UTF8 1
+#endif
+
+static inline int
+enc_quoted(Encoder* e,
+           const unsigned char* JIFFY_RESTRICT data,
+           size_t size,
+           int latin1_only)
 {
     static const int MAX_ESCAPE_LEN = 12;
-    unsigned char data[512];
+    size_t i = 0;
+    size_t start;
+    size_t ulen;
+    int uval;
+    int esc_len;
 
-    size_t size;
-    int i;
-
-    if(!enif_get_atom(e->env, val, (char*)data, 512, ERL_NIF_LATIN1)) {
-        return 0;
-    }
-
-    size = strlen((const char*)data);
-
-    /* Reserve space for the first quotation mark and most of the output. */
     if(!enc_ensure(e, size + MAX_ESCAPE_LEN + 1)) {
         return 0;
     }
 
     e->p[e->i++] = '\"';
 
-    i = 0;
     while(i < size) {
         if(!enc_ensure(e, MAX_ESCAPE_LEN)) {
             return 0;
         }
 
-        if(enc_special_character(e, data[i])) {
+        if(JIFFY_UNLIKELY(enc_special_character(e, data[i]))) {
             i++;
-        } else if(data[i] < 0x80) {
-            e->p[e->i++] = data[i];
+        } else if(JIFFY_LIKELY(data[i] < 0x80)) {
+            // Scan ahead for plain ASCII chars that don't need escaping.
+            start = i;
             i++;
-        } else if(data[i] >= 0x80) {
-            /* The atom encoding is latin1, so we don't need validation
-             * as all latin1 characters are valid Unicode codepoints. */
-            if (!e->uescape) {
-                e->i += unicode_to_utf8(data[i], &e->p[e->i]);
+            if(e->escape_forward_slashes) {
+                while(i < size
+                        && data[i] >= 0x20
+                        && data[i] < 0x80
+                        && data[i] != '\"'
+                        && data[i] != '\\'
+                        && data[i] != '/') {
+                    i++;
+                }
             } else {
-                e->i += unicode_uescape(data[i], &e->p[e->i]);
+                i = jiffy_scan_ascii_string_body(data, size, i);
             }
-
+            size_t run = i - start;
+            if(!enc_ensure(e, run)) {
+                return 0;
+            }
+            memcpy(&(e->p[e->i]), &data[start], run);
+            e->i += run;
+        } else if(latin1_only) {
+            if(JIFFY_UNLIKELY(e->uescape)) {
+                e->i += unicode_uescape((int)data[i], &(e->p[e->i]));
+            } else {
+                e->i += unicode_to_utf8((int)data[i], &(e->p[e->i]));
+            }
             i++;
+        } else if(JIFFY_UNLIKELY(e->uescape)) {
+            ulen = utf8_validate((unsigned char*)&(data[i]), size - i);
+            if(JIFFY_UNLIKELY(ulen == 0)) {
+                return 0;
+            }
+            uval = utf8_to_unicode((unsigned char*)&(data[i]), size - i);
+            if(uval < 0) {
+                return 0;
+            }
+            esc_len = unicode_uescape(uval, &(e->p[e->i]));
+            if(esc_len < 0) {
+                return 0;
+            }
+            e->i += esc_len;
+            i += ulen;
+        } else {
+            // Non-ASCII UTF-8 . Scan through the run first and then validate
+            // the whole thing, kinda how we do it for ASCII only.
+            start = i;
+            i++;
+            if(e->escape_forward_slashes) {
+                while(i < size
+                        && data[i] >= 0x20
+                        && data[i] != '\"'
+                        && data[i] != '\\'
+                        && data[i] != '/') {
+                    i++;
+                }
+            } else {
+                i = jiffy_scan_utf8_string_body(data, size, i);
+            }
+            size_t run = i - start;
+            if(JIFFY_UNLIKELY(!utf8_validate_range(&data[start], run))) {
+                return 0;
+            }
+            if(JIFFY_UNLIKELY(!enc_ensure(e, run))) {
+                return 0;
+            }
+            memcpy(&(e->p[e->i]), &data[start], run);
+            e->i += run;
         }
     }
 
@@ -313,100 +475,40 @@ enc_atom(Encoder* e, ERL_NIF_TERM val)
     e->count++;
 
     return 1;
+}
+
+static int
+enc_atom(Encoder* e, ERL_NIF_TERM val)
+{
+    // 255 code points * max 4 UTF-8 bytes + NUL fits in 1024.
+    unsigned char data[1024];
+    int n;
+
+#ifdef JIFFY_ENIF_HAS_UTF8
+    n = enif_get_atom(e->env, val, (char*)data, sizeof(data), ERL_NIF_UTF8);
+    if(n <= 0) {
+        return 0;
+    }
+    return enc_quoted(e, data, (size_t)n - 1, 0);
+#else
+    n = enif_get_atom(e->env, val, (char*)data, sizeof(data), ERL_NIF_LATIN1);
+    if(n <= 0) {
+        return 0;
+    }
+    return enc_quoted(e, data, (size_t)n - 1, 1);
+#endif
 }
 
 static int
 enc_string(Encoder* e, ERL_NIF_TERM val)
 {
-    static const int MAX_ESCAPE_LEN = 12;
     ErlNifBinary bin;
-
-    unsigned char* data;
-    size_t size;
-    int esc_len;
-    int ulen;
-    int uval;
-    int i;
 
     if(!enif_inspect_binary(e->env, val, &bin)) {
         return 0;
     }
 
-    data = bin.data;
-    size = bin.size;
-
-    /* Reserve space for the first quotation mark and most of the output. */
-    if(!enc_ensure(e, size + MAX_ESCAPE_LEN + 1)) {
-        return 0;
-    }
-
-    e->p[e->i++] = '\"';
-
-    i = 0;
-    while(i < size) {
-        if(!enc_ensure(e, MAX_ESCAPE_LEN)) {
-            return 0;
-        }
-
-        if(enc_special_character(e, data[i])) {
-            i++;
-        } else if(data[i] < 0x80) {
-            e->p[e->i++] = data[i++];
-        } else if(data[i] >= 0x80) {
-            ulen = utf8_validate(&(data[i]), size - i);
-
-            if (ulen < 0) {
-                return 0;
-            } else if (e->uescape) {
-                uval = utf8_to_unicode(&(data[i]), size-i);
-                if(uval < 0) {
-                    return 0;
-                }
-
-                esc_len = unicode_uescape(uval, &(e->p[e->i]));
-                if(esc_len < 0) {
-                    return 0;
-                }
-
-                e->i += esc_len;
-            } else {
-                memcpy(&e->p[e->i], &data[i], ulen);
-                e->i += ulen;
-            }
-
-            i += ulen;
-        }
-    }
-
-    if(!enc_ensure(e, 1)) {
-        return 0;
-    }
-
-    e->p[e->i++] = '\"';
-    e->count++;
-
-    return 1;
-}
-
-static inline int
-enc_object_key(ErlNifEnv *env, Encoder* e, ERL_NIF_TERM val)
-{
-    if(enif_is_atom(env, val)) {
-        return enc_atom(e, val);
-    }
-
-    ErlNifSInt64 lval;
-    if(enif_get_int64(env, val, &lval)) {
-        int res = enc_char(e, '"');
-        if (!res) return res;
-
-        res = enc_long(e, lval);
-        if (!res) return res;
-
-        return enc_char(e, '"');
-    }
-
-    return enc_string(e, val);
+    return enc_quoted(e, bin.data, bin.size, 0);
 }
 
 // From https://www.slideshare.net/andreialexandrescu1/three-optimization-tips-for-c-15708507
@@ -424,7 +526,7 @@ enc_object_key(ErlNifEnv *env, Encoder* e, ERL_NIF_TERM val)
 #define P11 100000000000L
 #define P12 1000000000000L
 
-int
+static inline int
 digits10(ErlNifUInt64 v)
 {
     if (v < P01) return 1;
@@ -448,7 +550,7 @@ digits10(ErlNifUInt64 v)
     return 12 + digits10(v / P12);
 }
 
-unsigned int
+static inline unsigned int
 u64ToAsciiTable(unsigned char *dst, ErlNifUInt64 value)
 {
     static const char digits[201] =
@@ -477,7 +579,7 @@ u64ToAsciiTable(unsigned char *dst, ErlNifUInt64 value)
     return length;
 }
 
-unsigned
+static inline unsigned
 i64ToAsciiTable(unsigned char *dst, ErlNifSInt64 value)
 {
     if (value < 0) {
@@ -504,20 +606,14 @@ enc_long(Encoder* e, ErlNifSInt64 val)
 static inline int
 enc_double(Encoder* e, double val)
 {
-    unsigned char* start;
-    size_t len;
-
     if(!enc_ensure(e, 32)) {
         return 0;
     }
 
-    start = &(e->p[e->i]);
+    // Normalize -0.0 to 0.0 for JSON output
+    if(val == 0.0) val = 0.0;
 
-    if(!double_to_shortest(start, e->buffer.size, &len, val)) {
-        return 0;
-    }
-
-    e->i += len;
+    e->i += d2s_buffered_n(val, (char*)&(e->p[e->i]));
     e->count++;
     return 1;
 }
@@ -531,6 +627,25 @@ enc_char(Encoder* e, char c)
 
     e->p[e->i++] = c;
     return 1;
+}
+
+static inline int
+enc_object_key(ErlNifEnv *env, Encoder* e, ERL_NIF_TERM val)
+{
+    ErlNifSInt64 ival;
+    double dval;
+
+    if(enif_is_atom(env, val)) {
+        return enc_atom(e, val);
+    }
+    if(enif_get_int64(env, val, &ival)) {
+        return enc_char(e, '"') && enc_long(e, ival) && enc_char(e, '"');
+    }
+    if(enif_get_double(env, val, &dval)) {
+        return enc_char(e, '"') && enc_double(e, dval) && enc_char(e, '"');
+    }
+
+    return enc_string(e, val);
 }
 
 static int
@@ -608,9 +723,7 @@ enc_comma(Encoder* e)
     return 1;
 }
 
-#if MAP_TYPE_PRESENT
-int
-enc_elixir_datetime(ErlNifEnv* env, Encoder* e, ERL_NIF_TERM map) {
+int enc_elixir_datetime(ErlNifEnv* env, Encoder* e, ERL_NIF_TERM map) {
     if(!enc_ensure(e, 26)) {
         return 0;
     }
@@ -665,7 +778,7 @@ enc_elixir_datetime(ErlNifEnv* env, Encoder* e, ERL_NIF_TERM map) {
     return 1;
 }
 
-int
+static int
 enc_map_to_ejson(ErlNifEnv* env, char* scrap, ERL_NIF_TERM map, ERL_NIF_TERM* out)
 {
     ErlNifMapIterator iter;
@@ -696,7 +809,6 @@ enc_map_to_ejson(ErlNifEnv* env, char* scrap, ERL_NIF_TERM map, ERL_NIF_TERM* ou
             enif_map_iterator_destroy(env, &iter);
             return 0;
         }
-
         if (enif_is_atom(env, key)
             && enif_get_atom(env, key, scrap, 11, ERL_NIF_LATIN1)
             && strcmp("__struct__", scrap) == 0) { continue; }
@@ -710,7 +822,6 @@ enc_map_to_ejson(ErlNifEnv* env, char* scrap, ERL_NIF_TERM map, ERL_NIF_TERM* ou
     *out = enif_make_tuple1(env, list);
     return 1;
 }
-#endif
 
 ERL_NIF_TERM
 encode_init(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
@@ -807,10 +918,12 @@ encode_iter(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 
     start = e->iosize + e->i;
 
+    const size_t yt = yield_threshold(e->bytes_per_red);
+
     while(!termstack_is_empty(&stack)) {
         bytes_processed = (e->iosize + e->i) - start;
 
-        if(should_yield(bytes_processed, e->bytes_per_red)) {
+        if(bytes_processed >= yt) {
 
             assert(enif_is_list(env, e->iolist));
 
@@ -821,7 +934,6 @@ encode_iter(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
             termstack_destroy(&stack);
             bump_used_reds(env, bytes_processed, e->bytes_per_red);
 
-#if SCHEDULE_NIF_PRESENT
             return enif_schedule_nif(
                     env,
                     "nif_encode_iter",
@@ -830,13 +942,7 @@ encode_iter(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
                     3,
                     tmp_argv
                 );
-#else
-            return enif_make_tuple2(
-                    env,
-                    st->atom_iter,
-                    enif_make_tuple_from_array(env, tmp_argv, 3)
-                );
-#endif
+
         }
 
         curr = termstack_pop(&stack);
@@ -935,8 +1041,12 @@ encode_iter(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
             }
         } else if(enif_get_tuple(env, curr, &arity, &tuple)) {
             if(arity != 1) {
-                ret = enc_obj_error(e, "invalid_ejson", curr);
-                goto done;
+                // Handle unknown or pre-encoded JSON in finish_encode/2
+                if(!enc_unknown(e, curr)) {
+                    ret = enc_error(e, "internal_error");
+                    goto done;
+                }
+                continue;
             }
             if(!enif_is_list(env, tuple[0])) {
                 ret = enc_obj_error(e, "invalid_object", curr);
@@ -961,7 +1071,7 @@ encode_iter(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
                 ret = enc_obj_error(e, "invalid_object_member_arity", item);
                 goto done;
             }
-           if(!enc_object_key(env, e, tuple[0])) {
+            if(!enc_object_key(env, e, tuple[0])) {
                 ret = enc_obj_error(e, "invalid_object_member_key", tuple[0]);
                 goto done;
             }
@@ -973,9 +1083,7 @@ encode_iter(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
             termstack_push(&stack, curr);
             termstack_push(&stack, e->atoms->ref_object);
             termstack_push(&stack, tuple[1]);
-#if MAP_TYPE_PRESENT
         } else if(enif_is_map(env, curr)) {
-
             if (enif_get_map_value(env, curr, e->atoms->atom_elixir_struct, &item) && enif_get_atom(env, item, (char*)scrap, 250, ERL_NIF_LATIN1)) {
                 if (strcmp("Elixir.DateTime", (char*)scrap) == 0) {
                     if (!enc_elixir_datetime(env, e, curr)) {
@@ -985,12 +1093,13 @@ encode_iter(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
                     continue;
                 }
             }
-            if (!enc_map_to_ejson(env, (char*)scrap, curr, &curr)) {
+
+            if(!enc_map_to_ejson(env, (char*)scrap, curr, &curr)) {
                 ret = enc_error(e, "internal_error");
                 goto done;
             }
+
             termstack_push(&stack, curr);
-#endif
         } else if(enif_is_list(env, curr)) {
             if(!enc_start_array(e)) {
                 ret = enc_error(e, "internal_error");

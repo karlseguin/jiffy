@@ -1,0 +1,152 @@
+name: ci
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+
+jobs:
+  linux:
+    name: ${{matrix.os}}-${{matrix.otp_version}}-${{matrix.rebar}}
+    runs-on: ${{matrix.os}}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        otp_version: [21,23,26,27,28]
+        os: [ubuntu-latest]
+        rebar: [rebar, rebar3]
+
+    container:
+      image: erlang:${{matrix.otp_version}}
+
+    steps:
+    - uses: actions/checkout@v6
+    - name: ${{matrix.rebar}} make check
+      run: |
+        make REBAR=${{matrix.rebar}} check
+
+  # Keep this no more than 2 releases away from EQC-mini beam files. Currently
+  # they are on OTP 25 so we can use erlang up to version 27 technically.
+  #
+  eqc-mini-25:
+    name: eqc-mini-25
+    runs-on: ubuntu-latest
+    container:
+      image: erlang:25
+    steps:
+      - uses: actions/checkout@v6
+      - name: rebar3 make check-with-eqc
+        run: |
+          make REBAR=rebar3 check-with-eqc
+
+  eqc-mini-27:
+    name: eqc-mini-27
+    runs-on: ubuntu-latest
+    container:
+      image: erlang:27
+    steps:
+      - uses: actions/checkout@v6
+      - name: rebar3 make check-with-eqc
+        run: |
+          make REBAR=rebar3 check-with-eqc
+
+  lcov-coverage:
+    name: lcov-coverage
+    runs-on: ubuntu-latest
+    container:
+      image: erlang:28
+    steps:
+      - uses: actions/checkout@v6
+      - name: install lcov
+        run: |
+          apt update
+          apt install -y --no-install-recommends --no-install-suggests lcov
+          make REBAR=rebar3 coverage
+
+  gcc-14:
+    name: gcc-14
+    runs-on: ubuntu-latest
+    container:
+      image: erlang:28
+    steps:
+      - uses: actions/checkout@v6
+      - name: install gcc-14
+        run: |
+          apt update
+          apt install -y --no-install-recommends --no-install-suggests gcc-14 g++-14
+      - name: make check
+        run: |
+          CC=gcc-14 CXX=g++-14 CFLAGS="-Wextra -Wno-unused-parameter" make check
+
+  clang-19:
+    name: clang-19
+    runs-on: ubuntu-latest
+    container:
+      image: erlang:28
+    steps:
+      - uses: actions/checkout@v6
+      - name: install clang
+        run: |
+          apt update
+          apt install -y --no-install-recommends --no-install-suggests clang-19
+      - name: make check
+        run: |
+          CC=clang-19 CXX=clang++-19 CFLAGS="-Wextra -Wno-unused-parameter" make check
+
+  macos:
+    name: macos
+    runs-on: ${{matrix.os}}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, macos-15, macos-26, macos-26-intel, macos-latest]
+
+    steps:
+    - uses: actions/checkout@v6
+    - name: install erlang
+      run: |
+        brew install erlang
+    - name: install rebar3
+      run: |
+        brew install rebar3
+    - name: make check
+      run: |
+        make check
+
+  windows:
+    name: windows
+    runs-on: ${{matrix.os}}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-2025]
+
+    steps:
+    - name: prevent git from messing up our json test files
+      run: |
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+    - uses: actions/checkout@v6
+    - uses: erlef/setup-beam@v1
+      with:
+        otp-version: '27'
+        rebar3-version: '3.23'
+    - name: make check
+      run: |
+        $path = vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -nologo -nocolor -property installationPath
+        if ($path) {
+            $path = join-path $path '\VC\Auxiliary\Build\vcvars64.bat'
+            if (test-path $path) {
+                cmd /s /c """$path"" $args && set" | where { $_ -match '(\w+)=(.*)' } | foreach {
+                    $null = new-item -force -path "Env:\$($Matches[1])" -value $Matches[2]
+                }
+            }
+        }
+        make check

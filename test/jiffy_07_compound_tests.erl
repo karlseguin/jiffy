@@ -9,8 +9,8 @@
 
 
 compound_success_test_() ->
-    [gen(ok, Case) || Case <- cases(ok)] ++ 
-    [gen(special_encoding, Case) || Case <- cases(special_encoding)].
+    [gen(ok, Case) || Case <- cases(ok)] ++
+    [gen(number_key_encoding, Case) || Case <- cases(number_key_encoding)].
 
 
 compound_failure_test_() ->
@@ -25,7 +25,7 @@ gen(ok, {J1, E, J2}) ->
         {"Encode", ?_assertEqual(J2, enc(E))}
     ]};
 
-gen(special_encoding, {J, E}) ->
+gen(number_key_encoding, {J, E}) ->
     {msg("~s", [J]), [
         {"Encode", ?_assertEqual(J, enc(E))}
     ]};
@@ -59,9 +59,19 @@ cases(ok) ->
         }
     ];
 
-cases(special_encoding) ->
+cases(number_key_encoding) ->
     [
-        {<<"{\"123\":\"foo\"}">>, {[{123, <<"foo">>}]}}
+        % Integer keys
+        {<<"{\"123\":\"foo\"}">>, {[{123, <<"foo">>}]}},
+        {<<"{\"-1\":\"n\"}">>, {[{-1, <<"n">>}]}},
+        {<<"{\"123\":\"a\",\"456\":\"b\"}">>, {[{123, <<"a">>}, {456, <<"b">>}]}},
+        {<<"{\"123\":\"v\"}">>, #{123 => <<"v">>}},
+        % These could change if we swtich away from Ryu
+        {<<"{\"1.5\":\"x\"}">>, {[{1.5, <<"x">>}]}},
+        {<<"{\"-2.5\":\"x\"}">>, {[{-2.5, <<"x">>}]}},
+        {<<"{\"0.0\":\"x\"}">>, {[{0.0, <<"x">>}]}},
+        {<<"{\"1.5\":\"a\",\"2.0\":\"b\"}">>, {[{1.5, <<"a">>}, {2.0, <<"b">>}]}},
+        {<<"{\"1.5\":\"v\"}">>, #{1.5 => <<"v">>}}
     ];
 
 cases(error) ->

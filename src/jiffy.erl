@@ -5,8 +5,6 @@
 -export([decode/1, decode/2, encode/1, encode/2]).
 -define(NOT_LOADED, not_loaded(?LINE)).
 
--compile([no_native]).
-
 -on_load(init/0).
 
 
@@ -22,16 +20,10 @@
 -type json_string() :: atom() | binary().
 -type json_number() :: integer() | float().
 
--ifdef(JIFFY_NO_MAPS).
-
--type json_object() :: {[{json_string(),json_value()}]}.
-
--else.
-
 -type json_object() :: {[{json_string(),json_value()}]}
                         | #{json_string() => json_value()}.
 
--endif.
+-type json_preencoded() :: {json, iodata()}.
 
 -type jiffy_decode_result() :: json_value()
                         | {has_trailer, json_value(), binary()}.
@@ -56,8 +48,8 @@
 -type decode_options() :: [decode_option()].
 -type encode_options() :: [encode_option()].
 
+-export_type([decode_options/0, encode_options/0]).
 -export_type([json_value/0, jiffy_decode_result/0]).
-
 
 -spec decode(iolist() | binary()) -> jiffy_decode_result().
 decode(Data) ->
@@ -71,8 +63,6 @@ decode(Data, Opts) when is_binary(Data), is_list(Opts) ->
             error(Error);
         {partial, EJson} ->
             finish_decode(EJson);
-        {iter, {_, Decoder, Val, Objs, Curr}} ->
-            decode_loop(Data, Decoder, Val, Objs, Curr);
         EJson ->
             EJson
     end;
@@ -80,12 +70,12 @@ decode(Data, Opts) when is_list(Data) ->
     decode(iolist_to_binary(Data), Opts).
 
 
--spec encode(json_value()) -> iodata().
+-spec encode(json_value() | json_preencoded()) -> iodata().
 encode(Data) ->
     encode(Data, []).
 
 
--spec encode(json_value(), encode_options()) -> iodata().
+-spec encode(json_value() | json_preencoded(), encode_options()) -> iodata().
 encode(Data, Options) ->
     ForceUTF8 = lists:member(force_utf8, Options),
     case nif_encode_init(Data, Options) of
@@ -99,8 +89,6 @@ encode(Data, Options) ->
             error(Error);
         {partial, IOData} ->
             finish_encode(IOData, []);
-        {iter, {Encoder, Stack, IOBuf}} ->
-            encode_loop(Data, Options, Encoder, Stack, IOBuf);
         [Bin] when is_binary(Bin) ->
             Bin;
         RevIOData when is_list(RevIOData) ->
@@ -109,28 +97,32 @@ encode(Data, Options) ->
 
 
 finish_decode({bignum, Value}) ->
-    list_to_integer(binary_to_list(Value));
-finish_decode({bignum_e, Value}) ->
-    {IVal, EVal} = case string:to_integer(binary_to_list(Value)) of
-        {I, [$e | ExpStr]} ->
-            {E, []} = string:to_integer(ExpStr),
-            {I, E};
-        {I, [$E | ExpStr]} ->
-            {E, []} = string:to_integer(ExpStr),
-            {I, E}
-    end,
-    try
-        IVal * math:pow(10, EVal)
-    catch
-        error:badarith ->
-            error({range, EVal})
-    end;
+    binary_to_integer(Value);
 finish_decode({bigdbl, Value}) ->
-    try
-        list_to_float(binary_to_list(Value))
-    catch
-        error:badarg ->
-            error({range, Value})
+    % Got something like a 1e400, 1.5e500, or 999...999.5. Split on e/E and if
+    % we do have an explicit exponent use math:pow/2 to create the float since
+    % Erlang/OTP's binary_to_float can't handle something like 1e10, it needs
+    % the first number (the mantissa) to have '.' in it (it has to be 1.0e10).
+    case binary:split(Value, [<<$e>>, <<$E>>]) of
+        [IStr, EStr] ->
+            EVal = binary_to_integer(EStr),
+            IVal = case binary:match(IStr, <<$.>>) of
+                nomatch -> binary_to_integer(IStr);
+                _ -> binary_to_float(IStr)
+            end,
+            try
+                IVal * math:pow(10, EVal)
+            catch
+                error:badarith ->
+                    error({range, Value})
+            end;
+        [_] ->
+            try
+                binary_to_float(Value)
+            catch
+                error:badarg ->
+                    error({range, Value})
+            end
     end;
 finish_decode({Pairs}) when is_list(Pairs) ->
     finish_decode_obj(Pairs, []);
@@ -141,7 +133,6 @@ finish_decode({has_trailer, Value, Rest}) ->
 finish_decode(Val) ->
     maybe_map(Val).
 
--ifndef(JIFFY_NO_MAPS).
 maybe_map(Obj) when is_map(Obj) ->
     maps:map(fun finish_decode_map/2, Obj);
 maybe_map(Val) ->
@@ -149,10 +140,6 @@ maybe_map(Val) ->
 
 finish_decode_map(_, V) ->
     finish_decode(V).
--else.
-maybe_map(Val) ->
-    Val.
--endif.
 
 finish_decode_obj([], Acc) ->
     {lists:reverse(Acc)};
@@ -172,8 +159,11 @@ finish_encode([], Acc) ->
 finish_encode([<<_/binary>>=B | Rest], Acc) ->
     finish_encode(Rest, [B | Acc]);
 finish_encode([Val | Rest], Acc) when is_integer(Val) ->
-    Bin = list_to_binary(integer_to_list(Val)),
-    finish_encode(Rest, [Bin | Acc]);
+    finish_encode(Rest, [integer_to_binary(Val) | Acc]);
+finish_encode([{json, Json} | Rest], Acc) ->
+    %% Pre-encoded JSON spliced into the output as-is. This came from
+    %% enc_unknown.
+    finish_encode(Rest, [Json | Acc]);
 finish_encode([InvalidEjson | _], _) ->
     error({invalid_ejson, InvalidEjson});
 finish_encode(_, _) ->
@@ -192,52 +182,11 @@ init() ->
     erlang:load_nif(filename:join(PrivDir, "jiffy"), 0).
 
 
-decode_loop(Data, Decoder, Val, Objs, Curr) ->
-    case nif_decode_iter(Data, Decoder, Val, Objs, Curr) of
-        {error, Error} ->
-            error(Error);
-        {partial, EJson} ->
-            finish_decode(EJson);
-        {iter, {_, NewDecoder, NewVal, NewObjs, NewCurr}} ->
-            decode_loop(Data, NewDecoder, NewVal, NewObjs, NewCurr);
-        EJson ->
-            EJson
-    end.
-
-
-encode_loop(Data, Options, Encoder, Stack, IOBuf) ->
-    ForceUTF8 = lists:member(force_utf8, Options),
-    case nif_encode_iter(Encoder, Stack, IOBuf) of
-        {error, {invalid_string, _}} when ForceUTF8 == true ->
-            FixedData = jiffy_utf8:fix(Data),
-            encode(FixedData, Options -- [force_utf8]);
-        {error, {invalid_object_member_key, _}} when ForceUTF8 == true ->
-            FixedData = jiffy_utf8:fix(Data),
-            encode(FixedData, Options -- [force_utf8]);
-        {error, Error} ->
-            error(Error);
-        {partial, IOData} ->
-            finish_encode(IOData, []);
-        {iter, {NewEncoder, NewStack, NewIOBuf}} ->
-            encode_loop(Data, Options, NewEncoder, NewStack, NewIOBuf);
-        [Bin] when is_binary(Bin) ->
-            Bin;
-        RevIOData when is_list(RevIOData) ->
-            lists:reverse(RevIOData)
-    end.
-
-
 not_loaded(Line) ->
     erlang:nif_error({not_loaded, [{module, ?MODULE}, {line, Line}]}).
 
 nif_decode_init(_Data, _Opts) ->
     ?NOT_LOADED.
 
-nif_decode_iter(_Data, _Decoder, _, _, _) ->
-    ?NOT_LOADED.
-
 nif_encode_init(_Data, _Options) ->
-    ?NOT_LOADED.
-
-nif_encode_iter(_Encoder, _Stack, _IoList) ->
     ?NOT_LOADED.

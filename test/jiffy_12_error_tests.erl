@@ -68,12 +68,33 @@ enc_invalid_object_member_arity_test_() ->
 
 enc_invalid_object_member_key_test_() ->
     Type = invalid_object_member_key,
-    E1 = {1, true},
     {"invalid_object_member_key", [
         {"Bad string", enc_error(Type, <<143>>, {[{<<143>>, true}]})},
+        {"Basic", enc_error(Type, [1], {[{[1], true}]})},
         {"Basic", enc_error(Type, {[{foo,bar}]}, {[{{[{foo,bar}]}, true}]})}
     ]}.
 
+
+decode_bad_option_test_() ->
+    [?_assertError(badarg, jiffy:decode(<<"1">>, [O])) || O <- [
+        not_a_valid_option,
+        <<"foo">>,
+        {foo, bar, baz},
+        {bytes_per_iter, not_an_int},
+        {bytes_per_red, not_an_int},
+        {some_other_opt, value},
+        {null_term, 123}
+    ]].
+
+
+encode_bad_option_test_() ->
+    [?_assertError(badarg, jiffy:encode(1, [O])) || O <- [
+        not_a_valid_option,
+        <<"foo">>,
+        {foo, bar, baz},
+        {bytes_per_iter, not_an_int},
+        {bytes_per_red, not_an_int}
+    ]].
 
 
 enc_error(Type, Obj, Case) ->

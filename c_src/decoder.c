@@ -2,23 +2,17 @@
 // See the LICENSE file for more information.
 
 #include <assert.h>
-#include <errno.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "erl_nif.h"
+#include "ffc.h"
 #include "jiffy.h"
-
-#define U(c) ((unsigned char) (c))
-#define ERROR(i, msg) make_error(st, env, msg)
+#include "jiffy_simd.h"
+#include "jiffy_utf8.h"
 
 #define STACK_SIZE_INC 64
-#define NUM_BUF_LEN 32
-
-#if WINDOWS || WIN32
-#define snprintf  _snprintf
-#endif
+#define JIFFY_SMALL_ARRAY_SIZE 64
 
 enum {
     st_value=0,
@@ -30,17 +24,6 @@ enum {
     st_done,
     st_invalid
 } JsonState;
-
-enum {
-    nst_init=0,
-    nst_sign,
-    nst_mantissa,
-    nst_frac0,
-    nst_frac1,
-    nst_frac,
-    nst_esign,
-    nst_edigit
-} JsonNumState;
 
 typedef struct {
     ErlNifEnv*      env;
@@ -58,24 +41,24 @@ typedef struct {
     ERL_NIF_TERM    null_term;
 
     unsigned char*  p;
-    int             i;
-    int             len;
+    size_t          i;
+    size_t          len;
 
     char*           st_data;
     int             st_size;
     int             st_top;
 } Decoder;
 
-Decoder*
+// Returns an allocated resource or crashes the VM. No need to
+// check return pointer for NULL
+static Decoder*
 dec_new(ErlNifEnv* env)
 {
     jiffy_st* st = (jiffy_st*) enif_priv_data(env);
+    // If enif_alloc_resource cannot allocate it crashes the VM
     Decoder* d = enif_alloc_resource(st->res_dec, sizeof(Decoder));
+    assert(d != NULL);
     int i;
-
-    if(d == NULL) {
-        return NULL;
-    }
 
     d->atoms = st;
 
@@ -105,7 +88,7 @@ dec_new(ErlNifEnv* env)
     return d;
 }
 
-void
+static void
 dec_init(Decoder* d, ErlNifEnv* env, ERL_NIF_TERM arg, ErlNifBinary* bin)
 {
     d->env = env;
@@ -125,7 +108,7 @@ dec_destroy(ErlNifEnv* env, void* obj)
     }
 }
 
-ERL_NIF_TERM
+static ERL_NIF_TERM
 dec_error(Decoder* d, const char* atom)
 {
     ERL_NIF_TERM pos = enif_make_int(d->env, d->i+1);
@@ -134,20 +117,20 @@ dec_error(Decoder* d, const char* atom)
     return enif_make_tuple2(d->env, d->atoms->atom_error, ret);
 }
 
-char
+static inline char
 dec_curr(Decoder* d)
 {
     assert(d->st_top > 0);
     return d->st_data[d->st_top - 1];
 }
 
-int
+static inline int
 dec_top(Decoder* d)
 {
     return d->st_top;
 }
 
-void
+static inline void
 dec_push(Decoder* d, char val)
 {
     int new_sz;
@@ -166,7 +149,7 @@ dec_push(Decoder* d, char val)
     d->st_data[d->st_top++] = val;
 }
 
-char
+static inline char
 dec_pop(Decoder* d) {
     char current = st_invalid;
 
@@ -179,7 +162,7 @@ dec_pop(Decoder* d) {
     return current;
 }
 
-void
+static void
 dec_pop_assert(Decoder* d, char val)
 {
     char current = dec_pop(d);
@@ -187,14 +170,14 @@ dec_pop_assert(Decoder* d, char val)
     (void)current;
 }
 
-int
+static int
 dec_string(Decoder* d, ERL_NIF_TERM* value)
 {
     int has_escape = 0;
     int num_escapes = 0;
     int st;
-    int ulen;
-    int ui;
+    size_t ulen;
+    size_t ui;
     int hi;
     int lo;
     char* chrbuf;
@@ -275,10 +258,12 @@ dec_string(Decoder* d, ERL_NIF_TERM* value)
                     return 0;
             }
         } else if(d->p[d->i] < 0x80) {
-            d->i++;
+            // Scan ahead plain ASCII as an optimization. The first
+            // byte has already been checked, so start at i+1.
+            d->i = jiffy_scan_ascii_string_body(d->p, d->len, d->i + 1);
         } else {
             ulen = utf8_validate(&(d->p[d->i]), d->len - d->i);
-            if(ulen < 0) {
+            if(ulen == 0) {
                 return 0;
             }
             d->i += ulen;
@@ -371,276 +356,103 @@ parse:
     return 1;
 }
 
-int
+static int
 dec_number(Decoder* d, ERL_NIF_TERM* value)
 {
-    ERL_NIF_TERM num_type = d->atoms->atom_error;
-    char state = nst_init;
-    char nbuf[NUM_BUF_LEN];
-    int st = d->i;
-    int has_frac = 0;
-    int has_exp = 0;
-    double dval;
-    long lval;
+    // ffc validates, parses, and picks int-vs-double in a single call
+    const unsigned char* JIFFY_RESTRICT p = d->p;
+    const size_t start = d->i;
+    const char* nstart = (const char*)&p[start];
+    const char* nend_max = (const char*)&p[d->len];
 
-    while(d->i < d->len) {
-        switch(state) {
-            case nst_init:
-                switch(d->p[d->i]) {
-                    case '-':
-                        state = nst_sign;
-                        d->i++;
-                        break;
-                    case '0':
-                        state = nst_frac0;
-                        d->i++;
-                        break;
-                    case '1':
-                    case '2':
-                    case '3':
-                    case '4':
-                    case '5':
-                    case '6':
-                    case '7':
-                    case '8':
-                    case '9':
-                        state = nst_mantissa;
-                        d->i++;
-                        break;
-                    default:
-                        return 0;
-                }
-                break;
+    ffc_json_number jn;
+    ffc_result r = ffc_parse_json_number(nstart, nend_max, &jn);
 
-            case nst_sign:
-                switch(d->p[d->i]) {
-                    case '0':
-                        state = nst_frac0;
-                        d->i++;
-                        break;
-                    case '1':
-                    case '2':
-                    case '3':
-                    case '4':
-                    case '5':
-                    case '6':
-                    case '7':
-                    case '8':
-                    case '9':
-                        state = nst_mantissa;
-                        d->i++;
-                        break;
-                    default:
-                        return 0;
-                }
-                break;
+    // After parsing r.ptr point to where parsing stops:
+    //   OK - first byte past the number
+    //   OUT_OF_RANGE - first byte past the number (same span, just doesn't fit)
+    //   INVALID - the offending byte
+    d->i = start + (size_t)(r.ptr - nstart);
 
-            case nst_mantissa:
-                switch(d->p[d->i]) {
-                    case '.':
-                        state = nst_frac1;
-                        d->i++;
-                        break;
-                    case 'e':
-                    case 'E':
-                        state = nst_esign;
-                        d->i++;
-                        break;
-                    case '0':
-                    case '1':
-                    case '2':
-                    case '3':
-                    case '4':
-                    case '5':
-                    case '6':
-                    case '7':
-                    case '8':
-                    case '9':
-                        d->i++;
-                        break;
-                    default:
-                        goto parse;
-                }
-                break;
-
-            case nst_frac0:
-                switch(d->p[d->i]) {
-                    case '.':
-                        state = nst_frac1;
-                        d->i++;
-                        break;
-                    case 'e':
-                    case 'E':
-                        state = nst_esign;
-                        d->i++;
-                        break;
-                    default:
-                        goto parse;
-                }
-                break;
-
-            case nst_frac1:
-                has_frac = 1;
-                switch(d->p[d->i]) {
-                    case '0':
-                    case '1':
-                    case '2':
-                    case '3':
-                    case '4':
-                    case '5':
-                    case '6':
-                    case '7':
-                    case '8':
-                    case '9':
-                        state = nst_frac;
-                        d->i++;
-                        break;
-                    default:
-                        goto parse;
-                }
-                break;
-
-            case nst_frac:
-                switch(d->p[d->i]) {
-                    case 'e':
-                    case 'E':
-                        state = nst_esign;
-                        d->i++;
-                        break;
-                    case '0':
-                    case '1':
-                    case '2':
-                    case '3':
-                    case '4':
-                    case '5':
-                    case '6':
-                    case '7':
-                    case '8':
-                    case '9':
-                        d->i++;
-                        break;
-                    default:
-                        goto parse;
-                }
-                break;
-
-            case nst_esign:
-                has_exp = 1;
-                switch(d->p[d->i]) {
-                    case '-':
-                    case '+':
-                    case '0':
-                    case '1':
-                    case '2':
-                    case '3':
-                    case '4':
-                    case '5':
-                    case '6':
-                    case '7':
-                    case '8':
-                    case '9':
-                        state = nst_edigit;
-                        d->i++;
-                        break;
-                    default:
-                        return 0;
-                }
-                break;
-
-            case nst_edigit:
-                switch(d->p[d->i]) {
-                    case '0':
-                    case '1':
-                    case '2':
-                    case '3':
-                    case '4':
-                    case '5':
-                    case '6':
-                    case '7':
-                    case '8':
-                    case '9':
-                        d->i++;
-                        break;
-                    default:
-                        goto parse;
-                }
-                break;
-
-            default:
-                return 0;
-        }
+    if(r.outcome == FFC_OUTCOME_INVALID_INPUT) {
+        return 0;
     }
 
-parse:
-
-    switch(state) {
-        case nst_init:
-        case nst_sign:
-        case nst_frac1:
-        case nst_esign:
-            return 0;
-        default:
-            break;
-    }
-
-    errno = 0;
-
-    if(d->i - st < NUM_BUF_LEN) {
-        memset(nbuf, 0, NUM_BUF_LEN);
-        memcpy(nbuf, &(d->p[st]), d->i - st);
-
-        if(has_frac || has_exp) {
-            dval = strtod(nbuf, NULL);
-            if(errno != ERANGE) {
-                *value = enif_make_double(d->env, dval);
-                return 1;
-            }
+    if(r.outcome == FFC_OUTCOME_OK) {
+        if(jn.kind == FFC_JSON_NUM_KIND_INT64) {
+            *value = enif_make_int64(d->env, jn.value.i64);
         } else {
-            lval = strtol(nbuf, NULL, 10);
-            if(errno != ERANGE) {
-                *value = enif_make_int64(d->env, lval);
-                return 1;
-            }
+            *value = enif_make_double(d->env, jn.value.f64);
         }
+        return 1;
     }
 
-    if(!has_frac && !has_exp) {
-        num_type = d->atoms->atom_bignum;
-    } else if(!has_frac && has_exp) {
-        num_type = d->atoms->atom_bignum_e;
-    } else {
-        num_type = d->atoms->atom_bigdbl;
-    }
+    ERL_NIF_TERM num_type = (jn.kind == FFC_JSON_NUM_KIND_INT64)
+        ? d->atoms->atom_bignum
+        : d->atoms->atom_bigdbl;
 
     d->is_partial = 1;
-    *value = enif_make_sub_binary(d->env, d->arg, st, d->i - st);
+    const size_t num_len = (size_t)(r.ptr - nstart);
+    *value = enif_make_sub_binary(d->env, d->arg, start, num_len);
     *value = enif_make_tuple2(d->env, num_type, *value);
     return 1;
 }
 
-ERL_NIF_TERM
+static ERL_NIF_TERM
 make_empty_object(ErlNifEnv* env, int ret_map)
 {
-#if MAP_TYPE_PRESENT
     if(ret_map) {
         return enif_make_new_map(env);
     }
-#endif
 
     return enif_make_tuple1(env, enif_make_list(env, 0));
 }
 
-ERL_NIF_TERM
+static inline ERL_NIF_TERM
 make_array(ErlNifEnv* env, ERL_NIF_TERM list)
 {
-    ERL_NIF_TERM ret = enif_make_list(env, 0);
     ERL_NIF_TERM item;
 
+    unsigned int count = 0;
+    enif_get_list_length(env, list, &count);
+
+    if(count == 0) {
+        return enif_make_list(env, 0);
+    }
+
+    ERL_NIF_TERM small_buf[JIFFY_SMALL_ARRAY_SIZE];
+    ERL_NIF_TERM* arr = (count <= JIFFY_SMALL_ARRAY_SIZE)
+        ? small_buf
+        : enif_alloc(count * sizeof(ERL_NIF_TERM));
+
+    // Fill array in reverse since list was reversed after parsing
+    unsigned int i = count;
     while(enif_get_list_cell(env, list, &item, &list)) {
-        ret = enif_make_list_cell(env, item, ret);
+        arr[--i] = item;
+    }
+
+    ERL_NIF_TERM ret = enif_make_list_from_array(env, arr, count);
+
+    if(arr != small_buf) {
+        enif_free(arr);
     }
 
     return ret;
+}
+
+// Scan ahead and look for whitespace. This is used when we saw at least one
+// whitespace character and then expect to find more.
+static inline size_t
+skip_whitespace(const unsigned char* JIFFY_RESTRICT p, size_t len, size_t i)
+{
+    while(i < len && (
+            p[i] == ' ' ||
+            p[i] == '\n' ||
+            p[i] == '\r' ||
+            p[i] == '\t')) {
+        i++;
+    }
+    return i;
 }
 
 ERL_NIF_TERM
@@ -656,10 +468,9 @@ decode_init(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
         return enif_make_badarg(env);
     }
 
+    // If allocation fails VM will crash.
     d = dec_new(env);
-    if(d == NULL) {
-        return make_error(st, env, "internal_error");
-    }
+    assert(d != NULL);
 
     tmp_argv[0] = argv[0];
     tmp_argv[1] = enif_make_resource(env, d);
@@ -680,11 +491,7 @@ decode_init(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
         } else if(get_bytes_per_red(env, val, &(d->bytes_per_red))) {
             continue;
         } else if(enif_is_identical(val, d->atoms->atom_return_maps)) {
-#if MAP_TYPE_PRESENT
             d->return_maps = 1;
-#else
-            return enif_make_badarg(env);
-#endif
         } else if(enif_is_identical(val, d->atoms->atom_return_trailer)) {
             d->return_trailer = 1;
         } else if(enif_is_identical(val, d->atoms->atom_dedupe_keys)) {
@@ -737,10 +544,14 @@ decode_iter(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 
     start = d->i;
 
+    const size_t yt = yield_threshold(d->bytes_per_red);
+    const unsigned char* JIFFY_RESTRICT p = d->p;
+    const size_t len = d->len;
+
     while(d->i < bin.size) {
         bytes_processed = d->i - start;
 
-        if(should_yield(bytes_processed, d->bytes_per_red)) {
+        if(bytes_processed >= yt) {
             assert(enif_is_list(env, objs));
             assert(enif_is_list(env, curr));
 
@@ -752,7 +563,6 @@ decode_iter(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 
             bump_used_reds(env, bytes_processed, d->bytes_per_red);
 
-#if SCHEDULE_NIF_PRESENT
             return enif_schedule_nif(
                     env,
                     "nif_decode_iter",
@@ -761,13 +571,6 @@ decode_iter(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
                     5,
                     tmp_argv
                 );
-#else
-            return enif_make_tuple2(
-                    env,
-                    st->atom_iter,
-                    enif_make_tuple_from_array(env, tmp_argv, 5)
-                );
-#endif
         }
 
         switch(dec_curr(d)) {
@@ -777,7 +580,7 @@ decode_iter(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
                     case '\n':
                     case '\r':
                     case '\t':
-                        d->i++;
+                        d->i = skip_whitespace(p, len, d->i + 1);
                         break;
                     case 'n':
                         if(d->i + 3 >= d->len) {
@@ -892,7 +695,7 @@ decode_iter(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
                     case '\n':
                     case '\r':
                     case '\t':
-                        d->i++;
+                        d->i = skip_whitespace(p, len, d->i + 1);
                         break;
                     case '\"':
                         if(!dec_string(d, &val)) {
@@ -936,7 +739,7 @@ decode_iter(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
                     case '\n':
                     case '\r':
                     case '\t':
-                        d->i++;
+                        d->i = skip_whitespace(p, len, d->i + 1);
                         break;
                     case ':':
                         dec_pop_assert(d, st_colon);
@@ -955,7 +758,7 @@ decode_iter(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
                     case '\n':
                     case '\r':
                     case '\t':
-                        d->i++;
+                        d->i = skip_whitespace(p, len, d->i + 1);
                         break;
                     case ',':
                         dec_pop_assert(d, st_comma);
@@ -1028,7 +831,7 @@ decode_iter(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
                     case '\n':
                     case '\r':
                     case '\t':
-                        d->i++;
+                        d->i = skip_whitespace(p, len, d->i + 1);
                         break;
                     default:
                         goto decode_done;
